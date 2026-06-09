@@ -303,6 +303,72 @@ def test_start_runtime_uses_flow_definition_without_legacy_start_metadata():
     assert execution_order == ["begin", "route", "branch", "done"]
 
 
+def test_listen_runtime_uses_flow_definition_without_legacy_listener_metadata():
+    execution_order = []
+
+    class DefinitionListenFlow(Flow):
+        @start()
+        def begin(self):
+            execution_order.append("begin")
+
+        @listen(begin)
+        def by_callable(self):
+            execution_order.append("by_callable")
+
+        @listen(and_(begin, by_callable))
+        def by_and(self):
+            execution_order.append("by_and")
+
+        @listen(or_(and_(begin, by_callable), "fallback"))
+        def nested(self):
+            execution_order.append("nested")
+
+    for method_name in ("by_callable", "by_and", "nested"):
+        method = DefinitionListenFlow.__dict__[method_name]
+        assert not hasattr(method, "__trigger_methods__")
+        assert not hasattr(method, "__condition_type__")
+        assert not hasattr(method, "__trigger_condition__")
+
+    DefinitionListenFlow._listeners = {}
+    DefinitionListenFlow().kickoff()
+
+    assert execution_order[0] == "begin"
+    assert {"by_callable", "by_and", "nested"}.issubset(execution_order)
+
+
+def test_router_runtime_uses_flow_definition_without_legacy_router_metadata():
+    execution_order = []
+
+    class DefinitionRouterFlow(Flow):
+        @start()
+        def begin(self):
+            execution_order.append("begin")
+            return "begin"
+
+        @router(begin, emit=["go_left"])
+        def decide(self):
+            execution_order.append("decide")
+            return "go_left"
+
+        @listen("go_left")
+        def handle_left(self):
+            execution_order.append("handle_left")
+
+    route = DefinitionRouterFlow.__dict__["decide"]
+    assert not hasattr(route, "__is_router__")
+    assert not hasattr(route, "__router_emit__")
+    assert not hasattr(route, "__trigger_methods__")
+    assert not hasattr(route, "__condition_type__")
+    assert not hasattr(route, "__trigger_condition__")
+
+    DefinitionRouterFlow._listeners = {}
+    DefinitionRouterFlow._routers = set()
+    DefinitionRouterFlow._router_emit = {}
+    DefinitionRouterFlow().kickoff()
+
+    assert execution_order == ["begin", "decide", "handle_left"]
+
+
 def test_async_flow():
     """Test an asynchronous flow."""
     execution_order = []

@@ -16,7 +16,6 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 FlowConditionType: TypeAlias = Literal["OR", "AND"]
-SimpleFlowCondition: TypeAlias = tuple[FlowConditionType, list[FlowMethodName]]
 
 __all__ = [
     "FlowCondition",
@@ -25,7 +24,6 @@ __all__ = [
     "FlowMethod",
     "ListenMethod",
     "RouterMethod",
-    "SimpleFlowCondition",
     "StartMethod",
 ]
 
@@ -83,8 +81,6 @@ class FlowMethod(Generic[P, R]):
 
         # Preserve flow-related attributes from wrapped method (e.g., from @human_feedback)
         for attr in [
-            "__is_router__",
-            "__router_emit__",
             "__human_feedback_config__",
             "__conversational_only__",  # gates registration on Flow.conversational
             "__flow_persistence_config__",
@@ -162,16 +158,6 @@ class StartMethod(FlowMethod[P, R]):
 class ListenMethod(FlowMethod[P, R]):
     """Wrapper for methods marked as flow listeners."""
 
-    __trigger_methods__: list[FlowMethodName] | None = None
-    __condition_type__: FlowConditionType | None = None
-    __trigger_condition__: FlowCondition | None = None
-
 
 class RouterMethod(FlowMethod[P, R]):
     """Wrapper for methods marked as flow routers."""
-
-    __is_router__: bool = True
-    __trigger_methods__: list[FlowMethodName] | None = None
-    __condition_type__: FlowConditionType | None = None
-    __trigger_condition__: FlowCondition | None = None
-    __router_emit__: list[str] | None = None

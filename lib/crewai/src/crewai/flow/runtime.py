@@ -90,26 +90,17 @@ from crewai.experimental.conversational import (
 )
 from crewai.experimental.conversational_mixin import _ConversationalMixin
 from crewai.flow.constants import AND_CONDITION, OR_CONDITION
-from crewai.flow.dsl._conditions import (
-    _extract_all_methods,
-    _extract_all_methods_recursive,
-    _normalize_condition,
-    _runtime_listener_condition_from_definition,
-    is_flow_condition_dict,
-    is_simple_flow_condition,
-)
-from crewai.flow.dsl._utils import (
-    build_flow_definition,
-    extract_flow_definition,
-)
+from crewai.flow.dsl._utils import build_flow_definition
 from crewai.flow.flow_context import current_flow_id, current_flow_request_id
-from crewai.flow.flow_definition import FlowDefinition, FlowDefinitionCondition
+from crewai.flow.flow_definition import (
+    FlowDefinition,
+    FlowDefinitionCondition,
+    FlowMethodDefinition,
+)
 from crewai.flow.flow_wrappers import (
-    FlowCondition,
     FlowMethod,
     ListenMethod,
     RouterMethod,
-    SimpleFlowCondition,
     StartMethod,
 )
 from crewai.flow.human_feedback import HumanFeedbackResult
@@ -162,6 +153,43 @@ ExecutionContext = Any  # type: ignore[assignment,misc]
 
 
 logger = logging.getLogger(__name__)
+
+
+def _definition_condition_parts(
+    condition: dict[str, Any],
+) -> tuple[str, list[FlowDefinitionCondition]]:
+    """Split a condition dict into its boolean type and sub-conditions.
+
+    A FlowDefinition condition dict always carries a single ``"and"`` or
+    ``"or"`` key mapping to a list of sub-conditions (see ``flow_definition``),
+    so we read it directly rather than re-validating the shape.
+    """
+    if "and" in condition:
+        return AND_CONDITION, condition["and"]
+    return OR_CONDITION, condition.get("or", [])
+
+
+def _definition_condition_method_names(
+    condition: FlowDefinitionCondition,
+) -> list[FlowMethodName]:
+    if isinstance(condition, str):
+        return [FlowMethodName(condition)]
+
+    _, sub_conditions = _definition_condition_parts(condition)
+    method_names: list[FlowMethodName] = []
+    for sub_condition in sub_conditions:
+        method_names.extend(_definition_condition_method_names(sub_condition))
+    return method_names
+
+
+def _definition_condition_is_multi_source_or(
+    condition: FlowDefinitionCondition,
+) -> bool:
+    if isinstance(condition, str):
+        return False
+
+    condition_type, sub_conditions = _definition_condition_parts(condition)
+    return condition_type == OR_CONDITION and len(sub_conditions) > 1
 
 
 def _resolve_persistence(value: Any) -> Any:
@@ -601,18 +629,10 @@ class FlowMeta(ModelMetaclass):
             annotations[attr_name] = ClassVar[type(attr_value)]
         namespace["__annotations__"] = annotations
 
-        cls = super().__new__(mcs, name, bases, namespace)
-
-        _, listeners, routers, router_emit = extract_flow_definition(namespace)
-
-        cls._listeners = listeners  # type: ignore[attr-defined]
-        cls._routers = routers  # type: ignore[attr-defined]
-        cls._router_emit = router_emit  # type: ignore[attr-defined]
         # The static FlowDefinition is built lazily (on first access via
         # ``Flow.flow_definition()`` or visualization), not at class-definition
         # time, to avoid AST parsing and diagnostic logging on every import.
-
-        return cls
+        return super().__new__(mcs, name, bases, namespace)
 
 
 class Flow(_ConversationalMixin, BaseModel, Generic[T], metaclass=FlowMeta):
@@ -627,9 +647,6 @@ class Flow(_ConversationalMixin, BaseModel, Generic[T], metaclass=FlowMeta):
     )
     __hash__ = object.__hash__
 
-    _listeners: ClassVar[dict[FlowMethodName, SimpleFlowCondition | FlowCondition]] = {}
-    _routers: ClassVar[set[FlowMethodName]] = set()
-    _router_emit: ClassVar[dict[FlowMethodName, list[FlowMethodName]]] = {}
     _flow_definition: ClassVar[FlowDefinition | None] = None
 
     # === EXPERIMENTAL: conversational mode ===
@@ -685,10 +702,16 @@ class Flow(_ConversationalMixin, BaseModel, Generic[T], metaclass=FlowMeta):
         ]
 
     @classmethod
+    def _definition_method(
+        cls, method_name: FlowMethodName
+    ) -> FlowMethodDefinition | None:
+        return cls.flow_definition().methods.get(str(method_name))
+
+    @classmethod
     def _definition_start_condition(
         cls, method_name: FlowMethodName
     ) -> FlowDefinitionCondition | None:
-        method_definition = cls.flow_definition().methods.get(str(method_name))
+        method_definition = cls._definition_method(method_name)
         if method_definition is None:
             return None
         start = method_definition.start
@@ -697,9 +720,21 @@ class Flow(_ConversationalMixin, BaseModel, Generic[T], metaclass=FlowMeta):
         return None
 
     @classmethod
+    def _definition_listen_condition(
+        cls, method_name: FlowMethodName
+    ) -> FlowDefinitionCondition | None:
+        method_definition = cls._definition_method(method_name)
+        return method_definition.listen if method_definition else None
+
+    @classmethod
     def _definition_has_start(cls, method_name: FlowMethodName) -> bool:
-        method_definition = cls.flow_definition().methods.get(str(method_name))
+        method_definition = cls._definition_method(method_name)
         return bool(method_definition and method_definition.is_start)
+
+    @classmethod
+    def _definition_is_router(cls, method_name: FlowMethodName) -> bool:
+        method_definition = cls._definition_method(method_name)
+        return bool(method_definition and method_definition.router)
 
     initial_state: Annotated[  # type: ignore[type-arg]
         type[BaseModel] | type[dict] | dict[str, Any] | BaseModel | None,
@@ -848,7 +883,7 @@ class Flow(_ConversationalMixin, BaseModel, Generic[T], metaclass=FlowMeta):
     _method_execution_counts: dict[FlowMethodName, int] = PrivateAttr(
         default_factory=dict
     )
-    _pending_and_listeners: dict[PendingListenerKey, set[FlowMethodName]] = PrivateAttr(
+    _pending_and_listeners: dict[PendingListenerKey, set[int]] = PrivateAttr(
         default_factory=dict
     )
     _fired_or_listeners: set[FlowMethodName] = PrivateAttr(default_factory=set)
@@ -1024,22 +1059,8 @@ class Flow(_ConversationalMixin, BaseModel, Generic[T], metaclass=FlowMeta):
         condition = type(self)._definition_start_condition(method_name)
         if condition is None:
             return False
-        condition_data = _runtime_listener_condition_from_definition(condition)
-        if is_simple_flow_condition(condition_data):
-            condition_type, methods = condition_data
-            if condition_type == OR_CONDITION:
-                return trigger in methods
-            pending_key = PendingListenerKey(method_name)
-            if pending_key not in self._pending_and_listeners:
-                self._pending_and_listeners[pending_key] = set(methods)
-            if trigger in self._pending_and_listeners[pending_key]:
-                self._pending_and_listeners[pending_key].discard(trigger)
-            if not self._pending_and_listeners[pending_key]:
-                self._pending_and_listeners.pop(pending_key, None)
-                return True
-            return False
-        return self._evaluate_condition(
-            condition_data,
+        return self._evaluate_definition_condition(
+            condition,
             trigger,
             method_name,
             pending_key_prefix=f"start:{method_name}",
@@ -1075,17 +1096,14 @@ class Flow(_ConversationalMixin, BaseModel, Generic[T], metaclass=FlowMeta):
             trigger_str = str(trigger)
             to_discard: list[FlowMethodName] = []
             for listener_name in candidates:
-                condition_data = self._listeners.get(listener_name)
-                if condition_data is None:
+                definition_condition = type(self)._definition_listen_condition(
+                    listener_name
+                )
+                if definition_condition is None:
                     continue
-                if is_simple_flow_condition(condition_data):
-                    _, methods = condition_data
-                    if trigger in methods or trigger_str in {str(m) for m in methods}:
-                        to_discard.append(listener_name)
-                elif is_flow_condition_dict(condition_data):
-                    all_methods = _extract_all_methods_recursive(condition_data)
-                    if trigger_str in {str(m) for m in all_methods}:
-                        to_discard.append(listener_name)
+                all_methods = _definition_condition_method_names(definition_condition)
+                if trigger_str in {str(m) for m in all_methods}:
+                    to_discard.append(listener_name)
             for listener_name in to_discard:
                 self._fired_or_listeners.discard(listener_name)
                 if rearmable is not None:
@@ -1112,41 +1130,32 @@ class Flow(_ConversationalMixin, BaseModel, Generic[T], metaclass=FlowMeta):
             this returns: {frozenset({'method_a', 'method_b'}): 'handler'}
         """
         racing_groups: dict[frozenset[FlowMethodName], FlowMethodName] = {}
+        flow_methods = type(self).flow_definition().methods
+        listener_conditions: dict[FlowMethodName, FlowDefinitionCondition] = {
+            FlowMethodName(method_name): method_definition.listen
+            for method_name, method_definition in flow_methods.items()
+            if method_definition.listen is not None
+            and not method_definition.router
+            and not method_definition.is_start
+        }
+
+        listener_methods: dict[FlowMethodName, list[FlowMethodName]] = {
+            listener_name: _definition_condition_method_names(condition)
+            for listener_name, condition in listener_conditions.items()
+        }
 
         method_to_listeners: dict[FlowMethodName, set[FlowMethodName]] = {}
-        for listener_name, condition_data in self._listeners.items():
-            if is_simple_flow_condition(condition_data):
-                _, methods = condition_data
-                for m in methods:
-                    method_to_listeners.setdefault(m, set()).add(listener_name)
-            elif is_flow_condition_dict(condition_data):
-                all_methods = _extract_all_methods_recursive(condition_data)
-                for m in all_methods:
-                    method_name = FlowMethodName(m) if isinstance(m, str) else m
-                    method_to_listeners.setdefault(method_name, set()).add(
-                        listener_name
-                    )
+        for listener_name, methods in listener_methods.items():
+            for method_name in methods:
+                method_to_listeners.setdefault(method_name, set()).add(listener_name)
 
-        for listener_name, condition_data in self._listeners.items():
-            if listener_name in self._routers:
-                continue
-
+        for listener_name, condition in listener_conditions.items():
             trigger_methods: set[FlowMethodName] = set()
-
-            if is_simple_flow_condition(condition_data):
-                condition_type, methods = condition_data
-                if condition_type == OR_CONDITION and len(methods) > 1:
-                    trigger_methods = set(methods)
-
-            elif is_flow_condition_dict(condition_data):
-                top_level_type = condition_data.get("type", OR_CONDITION)
-                if top_level_type == OR_CONDITION:
-                    all_methods = _extract_all_methods_recursive(condition_data)
-                    if len(all_methods) > 1:
-                        trigger_methods = set(
-                            FlowMethodName(m) if isinstance(m, str) else m
-                            for m in all_methods
-                        )
+            if isinstance(condition, dict):
+                top_level_type, _ = _definition_condition_parts(condition)
+                all_methods = listener_methods[listener_name]
+                if top_level_type == OR_CONDITION and len(all_methods) > 1:
+                    trigger_methods = set(all_methods)
 
             if trigger_methods:
                 exclusive_methods = {
@@ -2448,7 +2457,7 @@ class Flow(_ConversationalMixin, BaseModel, Generic[T], metaclass=FlowMeta):
         )
 
         # If start method is a router, use its result as an additional trigger
-        if start_method_name in self._routers and result is not None:
+        if type(self)._definition_is_router(start_method_name) and result is not None:
             # Execute listeners for the start method name first
             await self._execute_listeners(start_method_name, result, finished_event_id)
             # Then execute listeners for the router result (e.g., "approved")
@@ -2772,82 +2781,62 @@ class Flow(_ConversationalMixin, BaseModel, Generic[T], metaclass=FlowMeta):
                             else:
                                 await self._execute_start_method(method_name)
 
-    def _evaluate_condition(
+    def _evaluate_definition_condition(
         self,
-        condition: str | FlowMethodName | FlowCondition,
+        condition: FlowDefinitionCondition,
         trigger_method: FlowMethodName,
         listener_name: FlowMethodName,
         pending_key_prefix: str | None = None,
     ) -> bool:
-        """Recursively evaluate a condition (simple or nested).
-
-        Args:
-            condition: Can be a string (method name) or dict (nested condition)
-            trigger_method: The method that just completed
-            listener_name: Name of the listener being evaluated
-
-        Returns:
-            True if the condition is satisfied, False otherwise
-        """
+        """Evaluate a FlowDefinition listener condition against a trigger."""
         if isinstance(condition, str):
-            return condition == trigger_method
+            return condition == str(trigger_method)
 
         def _sub_prefix(index: int) -> str | None:
             if pending_key_prefix is None:
                 return None
             return f"{pending_key_prefix}:{index}"
 
-        if is_flow_condition_dict(condition):
-            normalized = _normalize_condition(condition)
-            cond_type = normalized.get("type", OR_CONDITION)
-            sub_conditions = normalized.get("conditions", [])
+        condition_type, sub_conditions = _definition_condition_parts(condition)
 
-            if cond_type == OR_CONDITION:
-                return any(
-                    self._evaluate_condition(
-                        sub_cond,
-                        trigger_method,
-                        listener_name,
-                        pending_key_prefix=_sub_prefix(index),
-                    )
-                    for index, sub_cond in enumerate(sub_conditions)
+        if condition_type == OR_CONDITION:
+            return any(
+                self._evaluate_definition_condition(
+                    sub_condition,
+                    trigger_method,
+                    listener_name,
+                    pending_key_prefix=_sub_prefix(index),
+                )
+                for index, sub_condition in enumerate(sub_conditions)
+            )
+
+        if condition_type == AND_CONDITION:
+            pending_key = PendingListenerKey(
+                pending_key_prefix
+                if pending_key_prefix is not None
+                else f"{listener_name}:{id(condition)}"
+            )
+
+            if pending_key not in self._pending_and_listeners:
+                self._pending_and_listeners[pending_key] = set(
+                    range(len(sub_conditions))
                 )
 
-            if cond_type == AND_CONDITION:
-                pending_key = PendingListenerKey(
-                    pending_key_prefix
-                    if pending_key_prefix is not None
-                    else f"{listener_name}:{id(condition)}"
-                )
+            pending_conditions = self._pending_and_listeners[pending_key]
+            for index, sub_condition in enumerate(sub_conditions):
+                if index not in pending_conditions:
+                    continue
+                if self._evaluate_definition_condition(
+                    sub_condition,
+                    trigger_method,
+                    listener_name,
+                    pending_key_prefix=_sub_prefix(index),
+                ):
+                    pending_conditions.discard(index)
 
-                if pending_key not in self._pending_and_listeners:
-                    all_methods = set(_extract_all_methods(condition))
-                    self._pending_and_listeners[pending_key] = all_methods
-
-                if trigger_method in self._pending_and_listeners[pending_key]:
-                    self._pending_and_listeners[pending_key].discard(trigger_method)
-
-                direct_methods_satisfied = not self._pending_and_listeners[pending_key]
-
-                nested_conditions_satisfied = all(
-                    (
-                        self._evaluate_condition(
-                            sub_cond,
-                            trigger_method,
-                            listener_name,
-                            pending_key_prefix=_sub_prefix(index),
-                        )
-                        if is_flow_condition_dict(sub_cond)
-                        else True
-                    )
-                    for index, sub_cond in enumerate(sub_conditions)
-                )
-
-                if direct_methods_satisfied and nested_conditions_satisfied:
-                    self._pending_and_listeners.pop(pending_key, None)
-                    return True
-
-                return False
+            if not pending_conditions:
+                self._pending_and_listeners.pop(pending_key, None)
+                return True
 
         return False
 
@@ -2872,67 +2861,32 @@ class Flow(_ConversationalMixin, BaseModel, Generic[T], metaclass=FlowMeta):
             - Separates router and normal listener evaluation
         """
         triggered: list[FlowMethodName] = []
+        flow_methods = type(self).flow_definition().methods
 
-        for listener_name, condition_data in self._listeners.items():
-            is_router = listener_name in self._routers
-
+        for method_name, method_definition in flow_methods.items():
+            is_router = method_definition.router
             if router_only != is_router:
                 continue
 
-            if not router_only and type(self)._definition_has_start(listener_name):
+            if method_definition.listen is None or method_definition.is_start:
                 continue
 
-            if is_simple_flow_condition(condition_data):
-                condition_type, methods = condition_data
+            method_flow_name = FlowMethodName(method_name)
+            condition = method_definition.listen
+            should_check_fired = (
+                _definition_condition_is_multi_source_or(condition) and not is_router
+            )
+            if should_check_fired and method_flow_name in self._fired_or_listeners:
+                continue
 
-                if condition_type == OR_CONDITION:
-                    # Only trigger multi-source OR listeners (or_(A, B, C)) once - skip if already fired
-                    # Simple single-method listeners fire every time their trigger occurs
-                    # Routers also fire every time - they're decision points
-                    has_multiple_triggers = len(methods) > 1
-                    should_check_fired = has_multiple_triggers and not is_router
-
-                    if (
-                        not should_check_fired
-                        or listener_name not in self._fired_or_listeners
-                    ):
-                        if trigger_method in methods:
-                            triggered.append(listener_name)
-                            # Only track multi-source OR listeners (not single-method or routers)
-                            if should_check_fired:
-                                self._fired_or_listeners.add(listener_name)
-                elif condition_type == AND_CONDITION:
-                    pending_key = PendingListenerKey(listener_name)
-                    if pending_key not in self._pending_and_listeners:
-                        self._pending_and_listeners[pending_key] = set(methods)
-                    if trigger_method in self._pending_and_listeners[pending_key]:
-                        self._pending_and_listeners[pending_key].discard(trigger_method)
-
-                    if not self._pending_and_listeners[pending_key]:
-                        triggered.append(listener_name)
-                        self._pending_and_listeners.pop(pending_key, None)
-
-            elif is_flow_condition_dict(condition_data):
-                # For complex conditions, check if top-level is OR and track accordingly
-                top_level_type = condition_data.get("type", OR_CONDITION)
-                is_or_based = top_level_type == OR_CONDITION
-
-                # Only track multi-source OR conditions (multiple sub-conditions), not routers
-                sub_conditions = condition_data.get("conditions", [])
-                has_multiple_triggers = is_or_based and len(sub_conditions) > 1
-                should_check_fired = has_multiple_triggers and not is_router
-
-                # Skip compound OR-based listeners that have already fired
-                if should_check_fired and listener_name in self._fired_or_listeners:
-                    continue
-
-                if self._evaluate_condition(
-                    condition_data, trigger_method, listener_name
-                ):
-                    triggered.append(listener_name)
-                    # Track compound OR-based listeners so they only fire once
-                    if should_check_fired:
-                        self._fired_or_listeners.add(listener_name)
+            if self._evaluate_definition_condition(
+                condition,
+                trigger_method,
+                method_flow_name,
+            ):
+                triggered.append(method_flow_name)
+                if should_check_fired:
+                    self._fired_or_listeners.add(method_flow_name)
 
         return triggered
 
@@ -2984,7 +2938,7 @@ class Flow(_ConversationalMixin, BaseModel, Generic[T], metaclass=FlowMeta):
 
                 # For routers, also check if any conditional starts they triggered are completed
                 # If so, continue their chains
-                if listener_name in self._routers:
+                if type(self)._definition_is_router(listener_name):
                     for start_method_name in type(
                         self
                     )._definition_start_method_names():

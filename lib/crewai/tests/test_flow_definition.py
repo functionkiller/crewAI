@@ -304,24 +304,15 @@ def test_flow_definition_fragments_cover_start_listen_and_condition_sugar():
 
     assert not hasattr(FragmentFlow.__dict__["begin"], "__is_start_method__")
     assert not hasattr(FragmentFlow.__dict__["restart"], "__trigger_methods__")
-    assert "restart" not in FragmentFlow._listeners
-    assert FragmentFlow._listeners["by_callable"] == ("OR", ["begin"])
-    assert FragmentFlow._listeners["by_string"] == ("OR", ["manual_event"])
-    assert FragmentFlow._listeners["by_and"] == {
-        "type": "AND",
-        "conditions": ["begin", "by_callable"],
-    }
-    assert FragmentFlow._listeners["nested"] == {
-        "type": "OR",
-        "conditions": [
-            {"type": "AND", "conditions": ["manual_event", "by_string"]},
-            "fallback_event",
-        ],
-    }
+    for method_name in ("by_callable", "by_string", "by_and", "nested"):
+        method = FragmentFlow.__dict__[method_name]
+        assert not hasattr(method, "__trigger_methods__")
+        assert not hasattr(method, "__condition_type__")
+        assert not hasattr(method, "__trigger_condition__")
 
 
-def test_extract_flow_definition_prefers_fragments_over_legacy_metadata():
-    class RegistryFlow(Flow):
+def test_flow_definition_prefers_fragments_over_legacy_metadata():
+    class FragmentPriorityFlow(Flow):
         @start()
         def begin(self):
             return "begin"
@@ -334,51 +325,20 @@ def test_extract_flow_definition_prefers_fragments_over_legacy_metadata():
         def decide(self):
             return "done"
 
-    handle = RegistryFlow.__dict__["handle"]
-    original_trigger_methods = handle.__trigger_methods__
+    handle = FragmentPriorityFlow.__dict__["handle"]
+    decide = FragmentPriorityFlow.__dict__["decide"]
     handle.__trigger_methods__ = ["wrong"]
+    decide.__router_emit__ = ["wrong"]
     try:
-        _, listeners, routers, router_emit = flow_dsl.extract_flow_definition(
-            {
-                "begin": RegistryFlow.__dict__["begin"],
-                "handle": handle,
-                "decide": RegistryFlow.__dict__["decide"],
-            }
-        )
+        definition = flow_dsl.build_flow_definition(FragmentPriorityFlow)
     finally:
-        handle.__trigger_methods__ = original_trigger_methods
+        delattr(handle, "__trigger_methods__")
+        delattr(decide, "__router_emit__")
 
-    assert listeners["handle"] == ("OR", ["begin"])
-    assert listeners["decide"] == ("OR", ["handle"])
-    assert routers == {"decide"}
-    assert router_emit == {"decide": ["done"]}
-
-
-def test_flow_definition_falls_back_to_legacy_listener_router_metadata_without_fragment():
-    class LegacyMetadataFlow(Flow):
-        @start()
-        def begin(self):
-            return "begin"
-
-        @router(begin, emit=["left"])
-        def decide(self):
-            return "left"
-
-        @listen("left")
-        def left(self):
-            return "left"
-
-    for method_name in ("decide", "left"):
-        method = LegacyMetadataFlow.__dict__[method_name]
-        delattr(method, "__flow_method_definition__")
-
-    definition = flow_dsl.build_flow_definition(LegacyMetadataFlow)
-
-    assert definition.methods["begin"].start is True
-    assert definition.methods["decide"].listen == "begin"
+    assert definition.methods["handle"].listen == "begin"
+    assert definition.methods["decide"].listen == "handle"
     assert definition.methods["decide"].router is True
-    assert definition.methods["decide"].emit == ["left"]
-    assert definition.methods["left"].listen == "left"
+    assert definition.methods["decide"].emit == ["done"]
 
 
 def test_human_feedback_emit_overrides_inner_router_emit():
@@ -399,9 +359,6 @@ def test_human_feedback_emit_overrides_inner_router_emit():
         @listen("approved")
         def proceed(self):
             return "ok"
-
-    assert "route" in FeedbackOverRouterFlow._routers
-    assert FeedbackOverRouterFlow._router_emit["route"] == ["approved", "rejected"]
 
     route = FeedbackOverRouterFlow.flow_definition().methods["route"]
     assert route.router is True
